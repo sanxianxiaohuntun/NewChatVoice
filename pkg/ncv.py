@@ -1,175 +1,133 @@
 import os
-from typing import Any, Dict, List, Union
-
+from typing import List, Dict, Any, Optional
 from .manager.config_manager import ConfigManager
 from .manager.user_data_manager import UserDataManager
-from .utils.split_long_sentence import split_long_sentence
-from .utils.synchronize_templates import synchronize_templates
-from .provider.provider_factory import ProviderFactory
-
+from .client.tts_client import TTSClient
+from .service.tts_service import TTSService
+from .service.translate_service import BaiduTranslateService
 
 class NCV:
+    """NewChatVoice主控制器"""
+    
     def __init__(self):
-        # 同步模板文件
-        synchronize_templates("plugins/NewChatVoice/templates", "data/plugins/NewChatVoice")
-        # 实例化配置管理器
+        """初始化NCV控制器"""
+        # 加载配置
         self.config_manager = ConfigManager("data/plugins/NewChatVoice/config")
-        # 实例化用户数据管理器
-        self.user_data_manager = UserDataManager(
-            self.config_manager.global_config["data_dir_path"],
-            "data/plugins/NewChatVoice/data",
-            self.config_manager.global_config
+        
+        # 初始化用户数据管理器
+        self.user_manager = UserDataManager(
+            self.config_manager.data_dir_path,
+            self.config_manager
+        )
+        
+        # 初始化TTS客户端和服务
+        self.tts_client = TTSClient(self.config_manager.one_tts_url)
+        self.tts_service = TTSService(self.tts_client, self.config_manager.temp_dir_path)
+        
+        # 创建临时目录
+        os.makedirs(self.config_manager.temp_dir_path, exist_ok=True)
+        
+        # 初始化翻译服务
+        baidu_config = self.config_manager.global_config.get("baidu_translate", {})
+        self.translate_service = BaiduTranslateService(
+            app_id=baidu_config.get("app_id", ""),
+            api_key=baidu_config.get("api_key", ""),
+            secret_key=baidu_config.get("secret_key", "")
         )
 
-        self.temp_dir_path = self.config_manager.global_config["temp_dir_path"]
-        self._check_temp_dir_path()
+    async def get_platforms(self) -> List[str]:
+        """获取支持的平台列表"""
+        return await self.tts_service.get_platforms()
 
-    def _check_temp_dir_path(self) -> None:
-        # 检查临时目录路径，如果不存在则创建
-        if not os.path.exists(self.temp_dir_path):
-            os.makedirs(self.temp_dir_path)
+    async def get_characters(self, platform: str) -> List[Dict[str, Any]]:
+        """获取指定平台的角色列表"""
+        return await self.tts_service.get_characters(platform)
 
-    async def validate_provider(self, provider_name: str) -> Union[str, None]:
-        # 验证提供者是否有效
-        provider_config = self.config_manager.global_config[provider_name]
-        provider = ProviderFactory.get_provider(provider_name, provider_config, self.temp_dir_path)
-        if provider_name == "acgn_ttson":
-            return await provider.check_token()
-        elif provider_name == "gpt_sovits":
-            return await provider.get_character_list()
-        return None
+    def get_user_preference(self, user_id: int) -> Dict[str, Any]:
+        """获取用户偏好设置"""
+        return self.user_manager.load_user_preference(user_id)
 
-    async def get_character_list(self, provider_name: str) -> List[Dict[str, Any]]:
-        # 获取提供者的角色列表
-        provider_config = self.config_manager.global_config[provider_name]
-        provider = ProviderFactory.get_provider(provider_name, provider_config, self.temp_dir_path)
-        return await provider.get_character_list()
+    def update_user_preference(self, user_id: int, preferences: Dict[str, Any]) -> None:
+        """更新用户偏好设置"""
+        self.user_manager.save_user_preference(user_id, preferences)
 
-    def load_user_preference(self, user_id: int) -> Dict[str, Any]:
-        # 加载用户偏好设置
-        return self.user_data_manager.load_user_preference(user_id)
+    async def generate_audio(
+        self,
+        user_id: int,
+        text: str,
+    ) -> Optional[str]:
+        """生成语音文件
+        
+        Args:
+            user_id: 用户ID
+            text: 要转换的文本
+            
+        Returns:
+            生成的语音文件路径,如果文本过长则返回None
+        """
+        try:
+            # 检查文本长度
+            if len(text) > self.config_manager.max_characters:
+                print(f"文本过长({len(text)}字符),已忽略")
+                return None
+            
+            # 获取用户配置
+            user_prefs = self.get_user_preference(user_id)
+            platform = user_prefs.get("provider", self.config_manager.default_provider)
+            voice_id = user_prefs.get("character", "")
+            
+            # 初始化options
+            options = {
+                "to_lang": "ZH",  # 默认中文
+                "auto_translate": 0
+            }
+            
+            # 检查是否需要翻译
+            translate_config = user_prefs.get("translate", self.config_manager.default_translate)
+            if translate_config.get("switch", False):
+                direction = translate_config.get("translate_direction", "")
+                if direction == "zh2jp":
+                    translated_result = await self.translate_service.translate(text, "zh", "jp")
+                    if translated_result and isinstance(translated_result, list) and len(translated_result) > 0:
+                        text = translated_result[0].get("dst", text)
+                        # print(f"翻译结果: {text}")
+                        # 设置为日语
+                        options["to_lang"] = "JP"
+                elif direction == "zh2en":
+                    translated_result = await self.translate_service.translate(text, "zh", "en")
+                    if translated_result and isinstance(translated_result, list) and len(translated_result) > 0:
+                        text = translated_result[0].get("dst", text)
+                        # print(f"翻译结果: {text}")
+                        # 设置为英语
+                        options["to_lang"] = "EN"
+            
+            if not voice_id:
+                raise ValueError("未设置语音角色")
+            
+            # 生成语音
+            path = await self.tts_service.generate_audio(
+                platform=platform,
+                text=text,
+                voice_id=voice_id,
+                options=options  # 传入语言选项
+            )
+            
+            if not path:
+                print(f"生成语音失败: {text}")
+                return None
+            
+            return path
+            
+        except Exception as e:
+            print(f"生成语音失败: {str(e)}")
+            return None
 
-    def update_user_provider(self, user_id: int, provider_name: str) -> str:
-        # 更新用户的TTS服务提供者
-        if provider_name not in ["acgn_ttson", "gpt_sovits"]:
-            return f"无效的TTS平台名称：{provider_name}"
-
-        preferences = self.load_user_preference(user_id)
-        preferences["provider"] = provider_name
-        self.user_data_manager._save_user_preference(user_id, preferences)
-
-        return f"用户 {user_id} 的TTS服务平台更新为 {provider_name}。"
-
-    async def update_voice_switch(self, user_id: int, voice_switch: bool) -> str:
-        # 更新用户的语音开关设置
-        preferences = self.load_user_preference(user_id)
-        preferences["voice_switch"] = voice_switch
-        self.user_data_manager._save_user_preference(user_id, preferences)
-
-        return f"用户 {user_id} 的语音开关更新为 {voice_switch}。"
-
-    async def update_character_config(self, user_id: int, provider_name: str, config_updates: Dict[str, Any]) -> str:
-        # 更新用户的角色配置
-        preferences = self.load_user_preference(user_id)
-        if provider_name not in preferences:
-            preferences[provider_name] = {}
-
-        character_list = await self.get_character_list(provider_name)
-
-        if provider_name == "acgn_ttson":
-            character_id = config_updates.get("character_id")
-            if character_id is not None:
-                character_id = int(character_id)
-                character_name = next((char["character_name"] for char in character_list if char["id"] == character_id),
-                                      None)
-                if character_name is not None:
-                    preferences[provider_name]["character_id"] = character_id
-                    preferences[provider_name]["character_name"] = character_name
-                    self.user_data_manager._save_user_preference(user_id, preferences)
-                    return f"用户 {user_id} 的 acgn_ttson 角色名称更新为 {character_name}。"
-                else:
-                    return f"角色 ID {character_id} 在 acgn_ttson 的角色列表中未找到。"
-            else:
-                return "未提供 acgn_ttson 的角色 ID。"
-
-        elif provider_name == "gpt_sovits":
-            character_name = config_updates.get("character_name")
-            emotion = config_updates.get("emotion")
-            if character_name is not None and emotion is not None:
-                # character_list示例：{'Hutao': ['default'], '申鹤': ['default']}
-                if character_name in character_list and emotion in character_list[character_name]:
-                    
-                    preferences[provider_name]["character_name"] = character_name
-                    preferences[provider_name]["emotion"] = emotion
-                    self.user_data_manager._save_user_preference(user_id, preferences)
-                    return f"用户 {user_id} 的 gpt_sovits 角色名称更新为 {character_name}，情感更新为 {emotion}。"
-                else:
-                    return f"角色名称 {character_name} 和情感 {emotion} 在 gpt_sovits 的角色列表中未找到。"
-            else:
-                return "未提供 gpt_sovits 的角色名称或情感。"
-
-        else:
-            return f"未知的TTS平台: {provider_name}"
-
-    async def auto_split_generate_audio(self, user_id: int, text: str) -> List[str]:
-        # 自动分割文本并生成音频
-        global_config = self.config_manager.global_config
-
-        user_preference = self.load_user_preference(user_id)
-        if not user_preference:
-            user_preference = self.user_data_manager._load_user_data_template()
-
-        provider_name = user_preference.get("provider", global_config["provider"])
-        provider_config = global_config[provider_name]
-
-        provider = ProviderFactory.get_provider(provider_name, provider_config, self.temp_dir_path)
-
-        if len(text) > global_config["max_characters"]:
-            short_sentences = split_long_sentence(text, global_config["max_characters"])
-        else:
-            short_sentences = [text]
-
-        voice_paths = []
-
-        if provider_name == "acgn_ttson":
-            character_id = user_preference.get("acgn_ttson", {}).get("character_id", provider_config["character_id"])
-            for sentence in short_sentences:
-                audio_path = await provider.generate_audio(sentence, character_id=character_id)
-                voice_paths.append(audio_path)
-        elif provider_name == "gpt_sovits":
-            character_name = user_preference.get("gpt_sovits", {}).get("character_name",
-                                                                       provider_config["character_name"])
-            emotion = user_preference.get("gpt_sovits", {}).get("emotion", provider_config["emotion"])
-            for sentence in short_sentences:
-                audio_path = await provider.generate_audio(sentence, character_name=character_name, emotion=emotion)
-                voice_paths.append(audio_path)
-        else:
-            raise ValueError(f"未知的TTS平台: {provider_name}")
-
-        return voice_paths
-
-    async def no_split_generate_audio(self, user_id: int, text: str) -> str:
-        # 不分割文本直接生成音频
-        global_config = self.config_manager.global_config
-
-        user_preference = self.load_user_preference(user_id)
-        if not user_preference:
-            user_preference = self.user_data_manager._load_user_data_template()
-
-        provider_name = user_preference.get("provider", global_config["provider"])
-        provider_config = global_config[provider_name]
-
-        provider = ProviderFactory.get_provider(provider_name, provider_config, self.temp_dir_path)
-
-        if provider_name == "acgn_ttson":
-            character_id = user_preference.get("acgn_ttson", {}).get("character_id", provider_config["character_id"])
-            audio_path = await provider.generate_audio(text, character_id=character_id)
-        elif provider_name == "gpt_sovits":
-            character_name = user_preference.get("gpt_sovits", {}).get("character_name",
-                                                                       provider_config["character_name"])
-            emotion = user_preference.get("gpt_sovits", {}).get("emotion", provider_config["emotion"])
-            audio_path = await provider.generate_audio(text, character_name=character_name, emotion=emotion)
-        else:
-            raise ValueError(f"未知的TTS平台: {provider_name}")
-
-        return audio_path
+    def cleanup(self) -> None:
+        """清理临时文件"""
+        temp_dir = self.config_manager.temp_dir_path
+        if os.path.exists(temp_dir):
+            for file in os.listdir(temp_dir):
+                try:
+                    os.remove(os.path.join(temp_dir, file))
+                except Exception as e:
+                    print(f"清理临时文件失败: {e}")

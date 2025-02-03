@@ -1,0 +1,46 @@
+# 全局配置文件
+
+# 默认TTS平台
+default_provider: ttson
+
+# 每个用户是否默认开启语音
+default_voice_switch: true
+
+# 每个用户是否默认开启文本返回
+default_text_switch: true
+
+# 每个用户的翻译配置
+default_translate:
+  # 是否启用翻译
+  switch: false
+  # 翻译方向，支持：zh2jp: 中文转日语, zh2en: 中文转英文
+  translate_direction: zh2jp
+
+# 最大文本长度
+max_characters: 300
+
+# 临时文件目录
+temp_dir_path: data/plugins/NewChatVoice/temp
+
+# 数据文件目录
+data_dir_path: data/plugins/NewChatVoice/data
+
+# TTS服务URL
+one_tts_url: http://127.0.0.1:5555
+
+# 各个TTS平台的默认配置
+default_tts_config:
+  ttson:
+    character_id: 2161
+
+  acgn_ttson:
+    character_id: 2075
+
+  # 添加新平台的默认配置
+  fish_audio:
+    character_id: 7f92f8afb8ec43bf81429cc1c9199cb1
+
+baidu_translate:
+  app_id: your_app_id
+  api_key: your_api_key
+  secret_key: your_secret_key
