@@ -1,15 +1,18 @@
-import json
-import os
 import base64
-
+from typing import List, AsyncGenerator
 from mirai import *
 from pkg.plugin.context import register, handler, BasePlugin, APIHost, EventContext
 from pkg.plugin.events import *
 from pkg.command import entities
 from pkg.command.operator import CommandOperator, operator_class
 from .pkg.ncv import NCV
+from mirai import Voice, Plain
+from pkg.platform.types import MessageChain, Plain, Voice
+from .pkg.utils.text_cleaner import clean_markdown
+from graiax import silkcoder
+import os
 
-# 定义命令常量
+# 命令常量
 CMD_ON = "开启"
 CMD_OFF = "关闭"
 CMD_STATUS = "状态"
@@ -17,211 +20,299 @@ CMD_LIST = "角色列表"
 CMD_PROVIDER = "平台"
 CMD_CHARACTER = "角色"
 CMD_HELP = "帮助"
-SUPPORTED_PROVIDERS = ["acgn_ttson", "gpt_sovits"]
+CMD_TEXT_ON = "文本开启"
+CMD_TEXT_OFF = "文本关闭"
+CMD_PLATFORMS = "平台列表"
+CMD_TRANSLATE_ON = "翻译开启"
+CMD_TRANSLATE_OFF = "翻译关闭"
+CMD_TRANSLATE_MODE = "翻译模式"
+
+HELP_TEXT = """
+!ncv 开启 - 开启语音功能
+!ncv 关闭 - 关闭语音功能
+!ncv 文本开启 - 开启文本返回
+!ncv 文本关闭 - 关闭文本返回
+!ncv 状态 - 查看当前设置
+!ncv 角色列表 - 查看可用角色
+!ncv 平台列表 - 查看支持的平台
+!ncv 平台 <平台名> - 切换TTS平台
+!ncv 角色 <角色ID> - 切换角色
+!ncv 帮助 - 显示此帮助
+!ncv 翻译开启 - 开启翻译功能
+!ncv 翻译关闭 - 关闭翻译功能
+!ncv 翻译模式 <zh2jp/zh2en> - 设置翻译模式"""
+
+CHARACTER_LIST = """
+由于角色过多，请在在线文档中查看角色列表
+【腾讯文档】NewChatVoice-海豚AI二次元角色列表（acgn_ttson）
+https://docs.qq.com/smartsheet/DSFZKZ1NEUUV5S0NS?tab=I36MjF
+【腾讯文档】NewChatVoice-海豚AI角色列表（ttson）
+https://docs.qq.com/smartsheet/DSFJ2cFVGbXdMZmhx?tab=hQeEMS"""
 
 
 @operator_class(name="ncv", help="获取帮助请输入：！ncv 帮助", privilege=1)
-class SwitchVoicePlugin(CommandOperator):
+class NCVOperator(CommandOperator):
+    """NCV命令处理器"""
+
     def __init__(self, host: APIHost):
         super().__init__(host)
         self.ncv = NCV()
 
-    async def enable_voice(self, sender_id):
-        provider_name = self.ncv.load_user_preference(sender_id)["provider"]
-        await self.ncv.update_voice_switch(sender_id, True)
-        return f"为用户{sender_id}开启语音合成，当前TTS平台为：{provider_name}"
-
-    async def disable_voice(self, sender_id):
-        provider_name = self.ncv.load_user_preference(sender_id)["provider"]
-        await self.ncv.update_voice_switch(sender_id, False)
-        return f"为用户{sender_id}关闭语音合成，当前TTS平台为：{provider_name}"
-
-    async def check_status(self, sender_id):
-        user_prefer = self.ncv.load_user_preference(sender_id)
-        provider = user_prefer["provider"]
-        character_name = user_prefer[provider]["character_name"]
-        return_text = (f"用户{sender_id}的当前语音合成状态为：\n"
-                       f"语音合成开关状态为：{'开启' if user_prefer['voice_switch'] else '关闭'}\n"
-                       f"使用的TTS平台为：{provider}\n"
-                       f"使用的角色为：{character_name}")
-        if provider == "gpt_sovits":
-            emotion = user_prefer[provider]["emotion"]
-            return_text += f"\n使用的情感为：{emotion}"
-        return return_text
-
-    async def list_characters(self, sender_id):
-        provider_name = self.ncv.load_user_preference(sender_id)["provider"]
-        if provider_name == "acgn_ttson":
-            return_text = (
-                f"当前TTS平台为：{provider_name}，角色列表：\n"
-                "当前角色较多，请查看云文档：\n"
-                "飞书云文档：https://s1c65jp249c.feishu.cn/sheets/WoiOsshwfhtUXRt2ZS0cVMCFnLc?from=from_copylink  \n"
-                "腾讯文档：https://docs.qq.com/sheet/DSFhQT3dUZkpabHVu?tab=BB08J2  \n"
-                "切换角色使用对应角色的id，例如切换角色为流萤(id为2075): \n !ncv 角色 2075"
-            )
-        elif provider_name == "gpt_sovits":
-            data = await self.ncv.get_character_list(provider_name)
-            character_list = ""
-            for name, emotions in data.items():
-                emotions_str = ",".join(emotions)
-                character_list += f"{name}：{emotions_str}\n"
-            return_text = (f"当前TTS平台：{provider_name}\n"
-                           "角色列表：\n"
-                           f"{character_list}\n"
-                           "切换角色使用对应角色的名称和情感，例如切换角色为胡桃，情感为default: \n"
-                           f"!ncv 角色 Hutao default"
-                           )
-        return return_text
-
-    async def switch_provider(self, sender_id, provider_name: str):
-        self.ncv.update_user_provider(sender_id, provider_name)
-        return f"为用户{sender_id}切换TTS平台为：{provider_name}"
-
-    async def switch_character(self, sender_id, character_info: str):
-        provider_name = self.ncv.load_user_preference(sender_id)["provider"]
-        if provider_name == "acgn_ttson":
-            character_id = character_info["character_id"]
-            response = await self.ncv.update_character_config(sender_id, provider_name, {"character_id": character_id})
-
-        elif provider_name == "gpt_sovits":
-            character_name = character_info["character_name"]
-            emotion = character_info["emotion"]
-            response = await self.ncv.update_character_config(sender_id, provider_name,
-                                                              {"character_name": character_name, "emotion": emotion})
-        return response
-
-    async def execute(self, context: entities.ExecuteContext) -> typing.AsyncGenerator[entities.CommandReturn, None]:
+    async def execute(self, context: entities.ExecuteContext) -> AsyncGenerator[entities.CommandReturn, None]:
         sender_id = int(context.query.sender_id)
-        command = context.crt_params[0]
-        if command in [CMD_ON, "on"]:
-            result = await self.enable_voice(sender_id)
-        elif command in [CMD_OFF, "off"]:
-            result = await self.disable_voice(sender_id)
-        elif command in [CMD_STATUS, "status"]:
-            result = await self.check_status(sender_id)
-        elif command in [CMD_LIST, "list"]:
-            result = await self.list_characters(sender_id)
-        elif command in [CMD_PROVIDER, "provider"]:
-            if len(context.crt_params) < 2:
-                result = "请指定TTS平台名称：acgn_ttson或gpt_sovits"
-            elif context.crt_params[1] not in SUPPORTED_PROVIDERS:
-                result = f"无效的TTS平台名称：{context.crt_params[1]}，当前支持的TTS平台有：acgn_ttson, gpt_sovits"
-            else:
-                result = await self.switch_provider(sender_id, context.crt_params[1])
-        elif command in [CMD_CHARACTER, "character"]:
-            if len(context.crt_params) < 2:
-                result = ("请指定角色信息，例如：\n"
-                          "acgn_ttson使用!ncv 角色 2075 "
-                          "gpt_sovits使用!ncv 角色 Hutao default"
-                          )
-            else:
-                provider = self.ncv.load_user_preference(sender_id)["provider"]
-                if provider == "acgn_ttson":
-                    character_id = context.crt_params[1]
-                    result = await self.switch_character(sender_id, {"character_id": character_id})
-                elif provider == "gpt_sovits":
-                    character_name = context.crt_params[1]
-                    emotion = context.crt_params[2]
-                    result = await self.switch_character(sender_id,
-                                                         {"character_name": character_name, "emotion": emotion})
+        command = context.crt_params[0] if context.crt_params else ""
 
-        elif command in [CMD_HELP, "help"]:
-            result = (
-                "NewChatVoice语音合成插件,一个可以生成多种音色的语音对话插件 \n"
-                "支持的指令有：\n"
-                "1. 为当前用户开启语音：\n"
-                "!ncv 开启  或  !ncv on\n"
-                "\n"
-                "2. 为当前用户关闭语音：\n"
-                "!ncv 关闭  或  !ncv off\n"
-                "\n"
-                "3. 查看当前用户语音合成状态：\n"
-                "!ncv 状态  或  !ncv status\n"
-                "\n"
-                "4.查看当前TTS平台的角色列表：\n"
-                "!ncv 角色列表  或  !ncv list\n"
-                "\n"
-                "5. 切换TTS平台：\n"
-                "!ncv 平台 <TTS平台名称>  或  !ncv provider <TTS平台名称>\n"
-                "\n"
-                "6. 切换当前TTS平台的角色：\n"
-                "!ncv 角色 <角色信息>  或  !ncv character <角色信息>\n"
-                "\n"
-                "7. 查看NewChatVoice插件的帮助：\n"
-                "!ncv 帮助  或  !ncv help\n"
-                "\n"
-                "8. 详细教程：https://github.com/the-lazy-me/NewChatVoice/tree/master"
-            )
-        else:
-            result = '无效指令，请输入"!ncv 帮助"查看帮助'
+        try:
+            result = await self._handle_command(sender_id, command, context.crt_params[1:])
+        except Exception as e:
+            result = f"执行命令时出错: {str(e)}"
+
         yield entities.CommandReturn(text=result)
 
+    async def _handle_command(self, sender_id: int, command: str, params: List[str]) -> str:
+        """处理命令"""
+        if command in [CMD_ON, "on"]:
+            return await self._enable_voice(sender_id)
 
-@register(name="NewChatVoice", description="一个可以生成多种音色的语音对话插件", version="2.2", author="the-lazy-me")
-class VoicePlugin(BasePlugin):
+        elif command in [CMD_OFF, "off"]:
+            return await self._disable_voice(sender_id)
+
+        elif command in [CMD_TEXT_ON, "text_on"]:
+            return await self._enable_text(sender_id)
+
+        elif command in [CMD_TEXT_OFF, "text_off"]:
+            return await self._disable_text(sender_id)
+
+        elif command in [CMD_STATUS, "status"]:
+            return await self._check_status(sender_id)
+
+        elif command in [CMD_LIST, "list"]:
+            return await self._list_characters(sender_id)
+
+        elif command in [CMD_PLATFORMS, "platforms"]:
+            return await self._list_platforms(sender_id)
+
+        elif command in [CMD_PROVIDER, "provider"]:
+            if not params:
+                return "请指定TTS平台名称"
+            return await self._switch_provider(sender_id, params[0])
+
+        elif command in [CMD_CHARACTER, "character"]:
+            if not params:
+                return "请指定角色ID"
+            return await self._switch_character(sender_id, params[0])
+
+        elif command in [CMD_HELP, "help"]:
+            return self._get_help()
+
+        elif command in ["翻译开启", "translate_on"]:
+            return await self._enable_translate(sender_id)
+        
+        elif command in ["翻译关闭", "translate_off"]:
+            return await self._disable_translate(sender_id)
+        
+        elif command in ["翻译模式", "translate_mode"]:
+            if not params:
+                return "请指定翻译模式(zh2jp/zh2en)"
+            return await self._set_translate_mode(sender_id, params[0])
+
+        return '无效指令，请输入"!ncv 帮助"查看帮助'
+
+    async def _enable_voice(self, sender_id: int) -> str:
+        """启用语音"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["voice_switch"] = True
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 开启语音功能"
+
+    async def _disable_voice(self, sender_id: int) -> str:
+        """禁用语音"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["voice_switch"] = False
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 关闭语音功能"
+
+    async def _enable_text(self, sender_id: int) -> str:
+        """启用文本返回"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["return_text"] = True
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 开启文本返回"
+
+    async def _disable_text(self, sender_id: int) -> str:
+        """禁用文本返回"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["return_text"] = False
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 关闭文本返回"
+
+    async def _check_status(self, sender_id: int) -> str:
+        """检查状态"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        status = []
+        status.append(f"用户: {sender_id}")
+        status.append(f"语音开关: {'开启' if prefs.get('voice_switch') else '关闭'}")
+        status.append(f"文本返回: {'开启' if prefs.get('return_text') else '关闭'}")
+        status.append(f"当前平台: {prefs.get('provider', '未设置')}")
+        status.append(f"当前角色: {prefs.get('character', '未设置')}")
+        translate_config = prefs.get("translate", {})
+        status.append(f"翻译功能: {'开启' if translate_config.get('switch') else '关闭'}")
+        status.append(f"翻译模式: {translate_config.get('translate_direction', '未设置')}")
+        return "\n".join(status)
+
+    async def _list_characters(self, sender_id: int) -> str:
+        """列出角色"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        platform = prefs.get("provider")
+        if not platform:
+            return "请先设置TTS平台"
+
+        return CHARACTER_LIST
+
+    async def _switch_provider(self, sender_id: int, provider: str) -> str:
+        """切换平台"""
+        platforms = await self.ncv.get_platforms()
+        if provider not in platforms:
+            return f"不支持的平台: {provider}"
+
+        # 获取该平台的默认配置
+        default_tts_config = self.ncv.config_manager.global_config.get(
+            "default_tts_config", {})
+        provider_config = default_tts_config.get(provider, {})
+        default_character = str(provider_config.get("character_id", ""))
+
+        # 更新用户配置
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["provider"] = provider
+        prefs["character"] = default_character  # 设置默认角色
+        self.ncv.update_user_preference(sender_id, prefs)
+
+        return f"已切换到平台: {provider}，默认角色ID: {default_character}"
+
+    async def _switch_character(self, sender_id: int, character_id: str) -> str:
+        """切换角色"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        prefs["character"] = str(character_id)  # 确保是字符串
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已切换到角色ID: {character_id}，请确保角色ID正确且存在，角色ID请通过!ncv 角色列表查看"
+
+    def _get_help(self) -> str:
+        """获取帮助信息"""
+        return HELP_TEXT
+
+    async def _list_platforms(self, sender_id: int) -> str:
+        """列出支持的平台"""
+        platforms = await self.ncv.get_platforms()
+        if not platforms:
+            return "暂无可用的TTS平台"
+
+        current_platform = self.ncv.get_user_preference(
+            sender_id).get("provider", "未设置")
+
+        result = ["支持的TTS平台:"]
+        for platform in platforms:
+            if platform == current_platform:
+                result.append(f"* {platform} (当前)")
+            else:
+                result.append(f"* {platform}")
+
+        return "\n".join(result)
+
+    async def _enable_translate(self, sender_id: int) -> str:
+        """启用翻译"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        if "translate" not in prefs:
+            prefs["translate"] = {}
+        prefs["translate"]["switch"] = True
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 开启翻译功能"
+
+    async def _disable_translate(self, sender_id: int) -> str:
+        """禁用翻译"""
+        prefs = self.ncv.get_user_preference(sender_id)
+        if "translate" not in prefs:
+            prefs["translate"] = {}
+        prefs["translate"]["switch"] = False
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已为用户 {sender_id} 关闭翻译功能"
+
+    async def _set_translate_mode(self, sender_id: int, mode: str) -> str:
+        """设置翻译模式"""
+        if mode not in ["zh2jp", "zh2en"]:
+            return "不支持的翻译模式，请使用: zh2jp(中译日) 或 zh2en(中译英)"
+        
+        prefs = self.ncv.get_user_preference(sender_id)
+        if "translate" not in prefs:
+            prefs["translate"] = {}
+        prefs["translate"]["translate_direction"] = mode
+        self.ncv.update_user_preference(sender_id, prefs)
+        return f"已设置翻译模式为: {mode}"
+
+
+@register(name="NewChatVoice", description="语音合成插件", version="3.0", author="the-lazy-me")
+class NCVPlugin(BasePlugin):
+    """NCV插件主类"""
+
     def __init__(self, host: APIHost):
         super().__init__(host)
         self.ncv = NCV()
-        self.voiceWithText = False
-        global_config = self._load_global_config()
-        self.voiceWithText = global_config.get('voiceWithText', False)
-        temp_dir_path = global_config.get('temp_dir_path', 'temp/')
-        self._clear_temp_dir(temp_dir_path)
-
-    def _load_global_config(self):
-        try:
-            with open("data/plugins/NewChatVoice/config/global_config.json", "r", encoding="utf-8") as file:
-                return json.load(file)
-        except Exception as e:
-            print(f"加载全局配置文件时出错: {e}")
-            return {}
-
-    def _clear_temp_dir(self, temp_dir_path: str):
-        try:
-            if not os.path.exists(temp_dir_path):
-                os.makedirs(temp_dir_path)
-            else:
-                for file in os.listdir(temp_dir_path):
-                    os.remove(os.path.join(temp_dir_path, file))
-        except Exception as e:
-            print(f"清理临时目录时出错: {e}")
+        
+        # 清空临时文件夹
+        temp_dir = self.ncv.config_manager.temp_dir_path
+        if os.path.exists(temp_dir):
+            for file in os.listdir(temp_dir):
+                try:
+                    file_path = os.path.join(temp_dir, file)
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"清理临时文件失败: {e}")
 
     @handler(NormalMessageResponded)
-    async def text_to_voice(self, ctx: EventContext):
-        user_prefer = self.ncv.load_user_preference(ctx.event.sender_id)
-        if not user_prefer["voice_switch"]:
+    async def handle_message(self, ctx: EventContext):
+        """处理消息"""
+        # 获取用户配置
+        user_id = ctx.event.sender_id
+        prefs = self.ncv.get_user_preference(user_id)
+
+        # 检查是否启用语音
+        if not prefs.get("voice_switch"):
             return
 
-        ctx.prevent_default()
-        target_type = str(ctx.event.query.launcher_type).split('.')[-1].lower()
-        sender_id = ctx.event.sender_id
-        group_id = ctx.event.launcher_id
-        text = ctx.event.response_text
-        text=text.replace(" ","")
-        text=text.replace("*","")        
+        # 清理Markdown格式并生成语音
+        text = clean_markdown(ctx.event.response_text)
+        try:
+            audio_path = await self.ncv.generate_audio(user_id, text)
+            if not audio_path:  # 文本过长或生成失败
+                return
+            
+            # 构建消息链
+            message_elements = []
+            
+            # 使用Voice消息发送
+            with open(audio_path, "rb") as f:
+                base64_audio = base64.b64encode(f.read()).decode()
+            message_elements.append(Voice(base64=base64_audio))
 
-        if target_type == "person":
-            receiver_id = sender_id
-            single_audio_path = await self.ncv.no_split_generate_audio(sender_id, text)
-            if single_audio_path:
-                # print(single_audio_path)
-                # base64编码
-                with open(single_audio_path, "rb") as f:
-                    base64_audio = base64.b64encode(f.read()).decode()
-                await ctx.send_message(target_type, receiver_id, [Voice(base64=base64_audio)])
-            # await ctx.send_message(target_type, receiver_id, [Voice(path=str(single_audio_path))])
-        elif target_type == "group":
-            receiver_id = group_id
-            audio_paths = await self.ncv.auto_split_generate_audio(sender_id, text)
-            if audio_paths:
-                for audio_path in audio_paths:
-                    # base64编码
-                    with open(audio_path, "rb") as f:
-                        base64_audio = base64.b64encode(f.read()).decode()
-                    await ctx.send_message(target_type, receiver_id, [Voice(base64=base64_audio)])
-                    # await ctx.send_message(target_type, receiver_id, [Voice(path=str(audio_path))])
-            if self.voiceWithText:
-                await ctx.send_message(target_type, receiver_id, [Plain(text)])
+            # 构建消息链并发送
+            if message_elements:
+                msg_chain = MessageChain(message_elements)
+                await ctx.reply(msg_chain)
+
+            # 根据用户设置决定是否返回文本
+            if not prefs.get("return_text"):
+                ctx.prevent_default()
+
+        except Exception as e:
+            print(f"生成语音失败: {e}")
+            return
+        finally:
+            # 清理临时文件
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception as e:
+                    print(f"清理临时文件失败: {e}")
 
     def __del__(self):
-        pass
+        """清理资源"""
+        self.ncv.cleanup()
